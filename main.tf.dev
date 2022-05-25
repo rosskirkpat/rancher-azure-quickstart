@@ -14,11 +14,13 @@ terraform {
     helm = {
       source = "hashicorp/helm"
     }
+  required_version = ">= 1.1.0"
   }
 }
 
 provider "azurerm" {
-   features {}
+  version = ">=1.1.2"
+  features {}
 }
 
 # common
@@ -33,7 +35,7 @@ resource "tls_private_key" "this" {
 }
 
 locals {
-    location = "eastus"
+    location = "eastus1"
     prefix = "team4-${random_integer.this.result}"
     public_ssh_key = "${tls_private_key.this.public_key_openssh}"
 }
@@ -53,20 +55,41 @@ resource "azurerm_virtual_network" "this" {
   address_space          = ["10.0.0.0/16"]
   location               = azurerm_resource_group.this.location
   resource_group_name    = azurerm_resource_group.this.name
+  subnet {
+    name                 = "${local.prefix}-rancher-subnet"
+    address_prefix       = "10.0.10.0/24"
+  }
+  subnet {
+    name                 = "${local.prefix}-downstream-subnet"
+    address_prefix       = "10.0.20.0/24"
+  }
+  subnet {
+    name                 = "${local.prefix}-bastion-subnet"
+    address_prefix       = "192.168.1.224/27"
+  }
+  subnet {
+    name                 = "${local.prefix}-mgmt-subnet"
+    address_prefix       = "10.0.100.0/24"
+  }
 }
 
-resource "azurerm_subnet" "rancher" {
-  name = "${local.prefix}-rancher-subnet"
-  resource_group_name    = azurerm_resource_group.this.name
-  virtual_network_name = azurerm_virtual_network.this.name
-  address_prefixes = [ "10.0.10.0/24" ]
-}
+resource "azurerm_storage_account" "this" {
+  name                = "${local.prefix}-storage"
+  resource_group_name = azurerm_resource_group.this.name
 
-resource "azurerm_subnet" "bastion" {
-  name = "AzureBastionSubnet"
-  resource_group_name    = azurerm_resource_group.this.name
-  virtual_network_name = azurerm_virtual_network.this.name
-  address_prefixes = [ "192.168.1.224/27" ]
+  location                 = azurerm_resource_group.this.location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
+
+  network_rules {
+    default_action             = "Deny"
+    ip_rules                   = ["10.0.1.0"]
+    virtual_network_subnet_ids = [azurerm_subnet.rancher.id]
+  }
+
+  tags = {
+    environment = "dev"
+  }
 }
 
 resource "azurerm_ssh_public_key" "this" {
@@ -76,13 +99,127 @@ resource "azurerm_ssh_public_key" "this" {
   public_key          = tls_private_key.this.public_key_openssh
 }
 
-resource "local_sensitive_file" "rancher_pem_file" {
-  filename = format("%s/%s", "${path.root}/keys", "${azurerm_ssh_public_key.this.name}.pem") 
-  content = tls_private_key.this.private_key_pem
+resource "local_file" "rancher_pem_file" {
+  filename = format("%s/%s", "${path.root}/keys", "${azurerm_ssh_public_key.this.key_name}.pem") 
+  sensitive_content = tls_private_key.this.private_key_pem
 }
 
-resource "azuread_service_principal" "team4_ad" {
-  application_id = "81852a25-ec2a-4360-b498-e3137ef41556" 
+# TODO: Store Rancher tokens in vault
+resource "azurerm_key_vault" "this" {
+  name                = "${local.prefix}-key-vault"
+  location            = azurerm_resource_group.this.location
+  resource_group_name = azurerm_resource_group.this.name
+  sku_name            = "standard"
+  tenant_id           = data.azurerm_client_config.current.tenant_id
+  admin {
+    email_address = "ross.kirkpatrick@suse.com"
+  }
+ soft_delete_retention_days = 7
+
+  access_policy {
+    tenant_id = data.azurerm_client_config.current.tenant_id
+    object_id = data.azurerm_client_config.current.object_id
+
+    certificate_permissions = [
+      "create",
+      "delete",
+      "deleteissuers",
+      "get",
+      "getissuers",
+      "import",
+      "list",
+      "listissuers",
+      "managecontacts",
+      "manageissuers",
+      "purge",
+      "setissuers",
+      "update",
+    ]
+
+    key_permissions = [
+      "backup",
+      "create",
+      "decrypt",
+      "delete",
+      "encrypt",
+      "get",
+      "import",
+      "list",
+      "purge",
+      "recover",
+      "restore",
+      "sign",
+      "unwrapKey",
+      "update",
+      "verify",
+      "wrapKey",
+    ]
+
+    secret_permissions = [
+      "backup",
+      "delete",
+      "get",
+      "list",
+      "purge",
+      "recover",
+      "restore",
+      "set",
+    ]
+  }
+}
+
+resource "azurerm_key_vault_certificate" "rancher" {
+  name         = "${local.prefix}-rancher-cert"
+  key_vault_id = azurerm_key_vault.this.id
+
+  certificate_policy {
+    issuer_parameters {
+      name = "Self"
+    }
+
+    key_properties {
+      exportable = true
+      key_size   = 4096
+      key_type   = "RSA"
+      reuse_key  = true
+    }
+
+    lifetime_action {
+      action {
+        action_type = "AutoRenew"
+      }
+
+      trigger {
+        days_before_expiry = 30
+      }
+    }
+
+    secret_properties {
+      content_type = "application/x-pkcs12"
+    }
+
+    x509_certificate_properties {
+      # Server Authentication = 1.3.6.1.5.5.7.3.1
+      # Client Authentication = 1.3.6.1.5.5.7.3.2
+      extended_key_usage = ["1.3.6.1.5.5.7.3.1"]
+
+      key_usage = [
+        "cRLSign",
+        "dataEncipherment",
+        "digitalSignature",
+        "keyAgreement",
+        "keyCertSign",
+        "keyEncipherment",
+      ]
+
+      subject_alternative_names {
+        dns_names = ["registry.rancherlabs.work", "rancher.rancherlabs.work"]
+      }
+
+      subject            = "CN=rancherlabs-work"
+      validity_in_months = 12
+    }
+  }
 }
 
 # bastion for private network
@@ -98,10 +235,6 @@ resource "azurerm_bastion_host" "rancher" {
   name                = "${local.prefix}-bastion"
   location            = azurerm_resource_group.this.location
   resource_group_name = azurerm_resource_group.this.name
-  tunneling_enabled = true
-  ip_connect_enabled = true
-  sku = "Standard"
-
 
   ip_configuration {
     name                 = "${local.prefix}-bastion-network"
@@ -110,6 +243,35 @@ resource "azurerm_bastion_host" "rancher" {
   }
 }
 
+# Bastion NSG
+resource "azurerm_network_security_group" "bastion" {
+  name                = "${local.prefix}-bastion-nsg"
+  location            = azurerm_resource_group.this.location
+  resource_group_name = azurerm_resource_group.this.name
+
+  security_rule {
+    name                       = "BastionHTTPSIn"
+    priority                   = 101
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "443"
+    source_address_prefixes      = [azurerm_virtual_network.this.address_space, "${chomp(data.http.myipv4.body)}/32"]
+    destination_address_prefix = "*"
+  }
+  security_rule {
+    name                       = "DenyAll"
+    priority                   = 102
+    direction                  = "Inbound"
+    access                     = "Deny"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_range     = "*"
+    source_address_prefixe      = "Internet"
+    destination_address_prefix = "*"
+  }
+}
 
 # Rancher NSGs
 resource "azurerm_network_security_group" "rancher" {
@@ -125,7 +287,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "*"
     source_port_range          = "*"
     destination_port_range     = "*"
-    source_address_prefix     = "Internet"
+    source_address_prefixe     = "Internet"
     destination_address_prefix = "*"
   }
 
@@ -137,7 +299,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "443"
-    source_address_prefixes      = [azurerm_virtual_network.this.address_space[0], "${chomp(data.http.myipv4.body)}/32"]
+    source_address_prefixes      = [azurerm_virtual_network.this.address_space, "${chomp(data.http.myipv4.body)}/32"]
     destination_address_prefix = "*"
   }
   
@@ -149,7 +311,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "80"
-    source_address_prefixes    = azurerm_virtual_network.this.address_space
+    source_address_prefix      = azurerm_virtual_network.this.address_space
     destination_address_prefix = "*"
   }
 
@@ -161,7 +323,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "2379-2380"
-    source_address_prefixes    = azurerm_virtual_network.this.address_space
+    source_address_prefix      = azurerm_virtual_network.this.address_space
     destination_address_prefix = "*"
   }
 
@@ -173,7 +335,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "2376"
-    source_address_prefixes    = azurerm_virtual_network.this.address_space
+    source_address_prefix      = azurerm_virtual_network.this.address_space
     destination_address_prefix = "*"
   }
 
@@ -185,7 +347,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "6443"
-    source_address_prefixes    = azurerm_virtual_network.this.address_space
+    source_address_prefix      = azurerm_virtual_network.this.address_space
     destination_address_prefix = "*"
   }
 
@@ -197,7 +359,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Udp"
     source_port_range          = "*"
     destination_port_range     = "8472"
-    source_address_prefixes    = azurerm_virtual_network.this.address_space
+    source_address_prefix      = azurerm_virtual_network.this.address_space
     destination_address_prefix = "*"
   }
 
@@ -209,7 +371,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Udp"
     source_port_range          = "*"
     destination_port_range     = "4789"
-    source_address_prefixes    = azurerm_virtual_network.this.address_space
+    source_address_prefix      = azurerm_virtual_network.this.address_space
     destination_address_prefix = "*"
   }
 
@@ -221,7 +383,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "5473"
-    source_address_prefixes    = azurerm_virtual_network.this.address_space
+    source_address_prefix      = azurerm_virtual_network.this.address_space
     destination_address_prefix = "*"
   }
   security_rule {
@@ -232,7 +394,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "10250-10252"
-    source_address_prefixes    = azurerm_virtual_network.this.address_space
+    source_address_prefix      = azurerm_virtual_network.this.address_space
     destination_address_prefix = "*"
   }
   security_rule {
@@ -243,7 +405,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "9345"
-    source_address_prefixes    = azurerm_virtual_network.this.address_space
+    source_address_prefix      = azurerm_virtual_network.this.address_space
     destination_address_prefix = "*"
   }
   security_rule {
@@ -254,7 +416,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "30000-32767"
-    source_address_prefixes    = azurerm_virtual_network.this.address_space
+    source_address_prefix      = azurerm_virtual_network.this.address_space
     destination_address_prefix = "*"
   }
   security_rule {
@@ -265,7 +427,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Udp"
     source_port_range          = "*"
     destination_port_range     = "30000-32767"
-    source_address_prefixes    = azurerm_virtual_network.this.address_space
+    source_address_prefix      = azurerm_virtual_network.this.address_space
     destination_address_prefix = "*"
   }
   security_rule {
@@ -276,7 +438,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "179"
-    source_address_prefixes    = azurerm_virtual_network.this.address_space
+    source_address_prefix      = azurerm_virtual_network.this.address_space
     destination_address_prefix = "*"
   }
   security_rule {
@@ -287,7 +449,7 @@ resource "azurerm_network_security_group" "rancher" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "9796"
-    source_address_prefixes    = azurerm_virtual_network.this.address_space
+    source_address_prefix      = azurerm_virtual_network.this.address_space
     destination_address_prefix = "*"
   }
   security_rule {
@@ -325,9 +487,10 @@ resource "azurerm_network_security_group" "rancher" {
   }
 }
 
-resource "azurerm_subnet_network_security_group_association" "rancher" {
-  subnet_id                 = azurerm_subnet.rancher.id
-  network_security_group_id = azurerm_network_security_group.rancher.id
+resource "azurerm_subnet" "mgmt" {
+  name                 = "${local.prefix}-mgmt-subnet"
+  resource_group_name  = azurerm_resource_group.this.name
+  virtual_network_name = azurerm_virtual_network.this.name
 }
 
 resource "azurerm_network_security_group" "mgmt" {
@@ -384,8 +547,8 @@ resource "azurerm_network_security_group" "mgmt" {
   }
 }
 
-resource "azurerm_subnet_network_security_group_association" "mgmt" {
-  subnet_id                 = azurerm_subnet.rancher.id
+resource azurerm_subnet_network_security_group_association "mgmt" {
+  subnet_id                 = azurerm_subnet.mgmt.id
   network_security_group_id = azurerm_network_security_group.mgmt.id
 }
 
@@ -394,24 +557,19 @@ resource "azuread_group" "dc_admins" {
   security_enabled = true
 }
 
-resource "random_password" "aad_admin" {
-  length           = 16
-  special          = true
-  override_special = "_%@"
-}
-
 resource "azuread_user" "admin" {
   user_principal_name = "${local.prefix}-dc-admin@rancherlabs.work"
   display_name        = "${local.prefix} DC Administrator"
-  password            = random_password.aad_admin.result
-  disable_password_expiration = true
-  account_enabled = true 
-  force_password_change = false
+  password            = "Pa55w0Rd!!1" // TODO: Generate password
 }
 
 resource "azuread_group_member" "admin" {
   group_object_id  = azuread_group.dc_admins.object_id
   member_object_id = azuread_user.admin.object_id
+}
+
+resource "azuread_service_principal" "team4_ad" {
+  application_id = "81852a25-ec2a-4360-b498-e3137ef41556" 
 }
 
 resource "azurerm_active_directory_domain_service" "this" {
@@ -424,7 +582,7 @@ resource "azurerm_active_directory_domain_service" "this" {
   filtered_sync_enabled = false
 
   initial_replica_set {
-    subnet_id                 = azurerm_subnet.rancher.id
+    subnet_id = azurerm_subnet.mgmt.id
   }
 
   notifications {
@@ -450,6 +608,18 @@ resource "azurerm_active_directory_domain_service" "this" {
   ]
 }
 
+resource "azurerm_network_interface" "this" {
+  name                = "${local.prefix}-nic"
+  resource_group_name = azurerm_resource_group.this.name
+  location            = azurerm_resource_group.this.location
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.internal.id
+    private_ip_address_allocation = "Dynamic"
+  }
+}
+
 resource "random_password" "postgres_admin" {
   length           = 16
   special          = true
@@ -473,10 +643,6 @@ resource "azurerm_postgresql_server" "this" {
   administrator_login_password = random_password.postgres_admin.result 
   version                      = "9.5"
   ssl_enforcement_enabled      = true
-  tags = {
-    RancherTeam = local.prefix
-    Environment = "dev"
-  }
 }
 
 resource "azurerm_postgresql_database" "this" {
@@ -487,36 +653,58 @@ resource "azurerm_postgresql_database" "this" {
   collation           = "English_United States.1252"
 }
 
-resource "azurerm_network_interface" "k3s_server" {
-  name                = "${local.prefix}-k3s-server-nic"
-  location            = azurerm_resource_group.this.location
-  resource_group_name = azurerm_resource_group.this.name
+# k3s server + agent managed disks
+resource "azurerm_managed_disk" "server" {
+  name                 = "${local.prefix}-k3s-server-1"
+  location             = azurerm_resource_group.this.location
+  resource_group_name  = azurerm_resource_group.this.name
+  storage_account_type = "Standard_LRS"
+  create_option        = "Empty"
+  disk_size_gb         = "20"
 
-  ip_configuration {
-    name                          = "k3s-server"
-    subnet_id                     = azurerm_subnet.rancher.id
-    private_ip_address_allocation = "Static"
+  tags = {
+    environment = "dev"
   }
 }
 
-# rancher k3s server  (control-plane)
-resource "azurerm_linux_virtual_machine" "rancher_server" {
-  name                = "${local.prefix}-rancher-k3s-server"
+resource "azurerm_managed_disk" "agent" {
+  name                 = "${local.prefix}-k3s-agent-1"
+  location             = azurerm_resource_group.this.location
+  resource_group_name  = azurerm_resource_group.this.name
+  storage_account_type = "Standard_LRS"
+  create_option        = "Empty"
+  disk_size_gb         = "20"
+
+  tags = {
+    environment = "dev"
+  }
+}
+
+# Configure the Rancher2 provider
+resource "random_password" "rancher_admin" {
+  length           = 16
+  special          = true
+  override_special = "_%@"
+}
+
+provider "rancher2" {
+  api_url    = var.rancher_api_endpoint
+  token_key  = var.rancher_api_token
+  insecure   = false
+}
+
+# rancher
+resource "azurerm_linux_virtual_machine_scale_set" "rancher" {
+  name                = "${local.prefix}-rancher-vmss"
   resource_group_name = azurerm_resource_group.this.name
   location            = azurerm_resource_group.this.location
-  size                = "Standard_F2"
+  sku                 = "Standard_F2"
+  instances           = 3
   admin_username      = "rancher"
-  network_interface_ids = [ azurerm_network_interface.k3s_server.id ]
 
   admin_ssh_key {
     username   = "rancher"
     public_key = azurerm_ssh_public_key.this.public_key
-  }
-
-  os_disk {
-    caching              = "ReadWrite"
-    storage_account_type = "Standard_LRS"
-    disk_size_gb         = 30
   }
 
   source_image_reference {
@@ -526,43 +714,148 @@ resource "azurerm_linux_virtual_machine" "rancher_server" {
     version   = "latest"
   }
 
-  tags = {
-    RancherTeam = local.prefix
-    Environment = "dev"
+  network_interface {
+    name    = "${local.prefix}-rancher"
+    primary = true
+
+    ip_configuration {
+      name      = "rancher"
+      primary   = true
+      subnet_id = azurerm_subnet.rancher.id
+    }
+  }
+
+  os_disk {
+    storage_account_type = "Standard_LRS"
+    caching              = "ReadWrite"
   }
 }
 
-resource "azurerm_network_interface" "k3s_agent" {
-  name                = "${local.prefix}-k3s-agent-nic"
-  location            = azurerm_resource_group.this.location
+provider "rancher2" {
+  alias     = "bootstrap"
+  insecure  = false
+  api_url   = azurerm_frontdoor
+  bootstrap = true
+  timeout   = "300s"
+}
+
+# Create a new rancher2_bootstrap using bootstrap provider config
+resource "rancher2_bootstrap" "admin" {
+  depends_on = [
+    helm_release.rancher_server
+  ]
+  provider   = rancher2.bootstrap
+  initial_password = "admin"
+  password   = random_password.rancher_password.result
+  telemetry  = true
+}
+
+# Provider config for admin
+provider "rancher2" {
+  alias     = "admin"
+  api_url   = rancher2_bootstrap.admin.url
+  token_key = rancher2_bootstrap.admin.token
+  insecure  = true
+}
+
+resource "rancher2_setting" "server-url" {
+  provider = rancher2.admin
+  name     = "server-url"
+  value    = rancher2_bootstrap.admin.url
+}
+
+resource "rancher2_token" "rancher-token" {
+  provider    = rancher2.admin
+  description = "Terraform ${var.owner} local cluster token"
+}
+
+# Create a new rancher2 resource using admin provider config
+resource "rancher2_catalog" "rancher" {
+  provider = rancher2.admin
+  name     = "rancher"
+  version  = "helm_v3"
+  url      = "https://releases.rancher.com/server-charts/stable"
+}
+
+# Rancher backup
+resource "rancher2_app_v2" "rancher-backup" {
+  provider   = rancher2.admin
+  cluster_id = "local"
+  name       = "rancher-backup"
+  namespace  = "cattle-resources-system"
+  repo_name  = "rancher-charts"
+  chart_name = "rancher-backup"
+}
+
+data "rancher2_role_template" "admin" {
+  depends_on = [rancher2_catalog.rancher]
+  provider   = rancher2.admin
+  name       = "Cluster Owner"
+}
+
+# frontdoor for Rancher
+resource "azurerm_frontdoor" "rancher" {
+  name                = "${local.prefix}-FrontDoor"
   resource_group_name = azurerm_resource_group.this.name
+  location            = azurerm_resource_group.this.location
 
-  ip_configuration {
-    name                          = "k3s-agent"
-    subnet_id                     = azurerm_subnet.rancher.id
-    private_ip_address_allocation = "Static"
+  routing_rule {
+    name               = "${local.prefix}-RoutingRule-Rancher"
+    accepted_protocols = ["Http", "Https"]
+    patterns_to_match  = ["/*"]
+    frontend_endpoints = ["${local.prefix}-FrontendEndpoint-Rancher"]
+    forwarding_configuration {
+      forwarding_protocol = "MatchRequest"
+      backend_pool_name   = "${local.prefix}-Backend-Rancher"
+    }
+  }
+
+  backend_pool_load_balancing {
+    name = "${local.prefix}-LoadBalancingSettings-Rancher"
+  }
+
+  backend_pool_health_probe {
+    name = "${local.prefix}-HealthProbeSetting-Rancher"
+  }
+
+  backend_pool {
+    name = "${local.prefix}-Backend-Rancher"
+    backend {
+      host_header = "www.rancher.rancherlabs.work"
+      address     = "www.rancher.rancherlabs.work"
+      http_port   = 80
+      https_port  = 443
+    }
+
+    load_balancing_name = "${local.prefix}-LoadBalancingSettings-Rancher"
+    health_probe_name   = "${local.prefix}-HealthProbeSetting-Rancher"
+  }
+
+  frontend_endpoint {
+    name      = "${local.prefix}-FrontendEndpoint-Rancher"
+    host_name = "${local.prefix}-${random_integer.this}.azurefd.net"
   }
 }
 
-# rancher k3s agent (worker)
-resource "azurerm_linux_virtual_machine" "rancher_agent" {
-  name                = "${local.prefix}-rancher-k3s-agent"
+# downstream control plane
+resource "azurerm_linux_virtual_machine" "control_plane" {
+  name                = "${var.prefix}-cp-machine"
   resource_group_name = azurerm_resource_group.this.name
   location            = azurerm_resource_group.this.location
   size                = "Standard_F2"
   admin_username      = "rancher"
-  network_interface_ids = [ azurerm_network_interface.k3s_agent.id ]
-
+  network_interface_ids = [
+    azurerm_network_interface.example.id,
+  ]
 
   admin_ssh_key {
-    username   = "rancher"
-    public_key = azurerm_ssh_public_key.this.public_key
+    username   = "adminuser"
+    public_key = file("~/.ssh/id_rsa.pub")
   }
 
   os_disk {
     caching              = "ReadWrite"
     storage_account_type = "Standard_LRS"
-    disk_size_gb         = 30
   }
 
   source_image_reference {
@@ -571,22 +864,18 @@ resource "azurerm_linux_virtual_machine" "rancher_agent" {
     sku       = "20.04-LTS"
     version   = "latest"
   }
-
-  tags = {
-    RancherTeam = local.prefix
-    Environment = "dev"
-  }
 }
 
-# downstream control-plane
 resource "azurerm_linux_virtual_machine_scale_set" "control_plane" {
-  name                = "${local.prefix}-ds-cp-vmss"
+  name                = "${var.prefix}-cp-vmss"
   resource_group_name = azurerm_resource_group.this.name
   location            = azurerm_resource_group.this.location
   sku                 = "Standard_F2"
   instances           = 3
   admin_username      = "rancher"
   upgrade_mode = "Manual"
+  custom_data = ""
+  user_data = ""
 
   admin_ssh_key {
     username   = "rancher"
@@ -607,32 +896,34 @@ resource "azurerm_linux_virtual_machine_scale_set" "control_plane" {
     ip_configuration {
       name      = "ds_controlplane"
       primary   = true
-      subnet_id = azurerm_subnet.rancher.id
+      subnet_id = azurerm_subnet.downstream.id
     }
   }
 
   os_disk {
     storage_account_type = "Standard_LRS"
     caching              = "ReadWrite"
-    disk_size_gb = 40
+  }
+  certificate {
+    url = "" //  This can be sourced from the secret_id field within the azurerm_key_vault_certificate Resource.
   }
 
-  tags = {
-    RancherTeam = local.prefix
-    Environment = "dev"
+  secret {
+    certificate = 
+    key_vault_id = 
   }
+
 }
 
 
 # downstream etcd
 resource "azurerm_linux_virtual_machine_scale_set" "etcd" {
-  name                = "${local.prefix}-ds-etcd-vmss"
+  name                = "${local.prefix}-etcd-vmss"
   resource_group_name = azurerm_resource_group.this.name
   location            = azurerm_resource_group.this.location
   sku                 = "Standard_F2"
   instances           = 3
   admin_username      = "rancher"
-  upgrade_mode = "Manual"
 
   admin_ssh_key {
     username   = "rancher"
@@ -653,32 +944,30 @@ resource "azurerm_linux_virtual_machine_scale_set" "etcd" {
     ip_configuration {
       name      = "ds_etcd"
       primary   = true
-      subnet_id = azurerm_subnet.rancher.id
+      subnet_id = azurerm_subnet.downstream.id
     }
   }
 
   os_disk {
     storage_account_type = "StandardSSD_LRS"
     caching              = "ReadWrite"
-    disk_size_gb = 40
   }
-  
-  tags = {
-    RancherTeam = local.prefix
-    Environment = "dev"
+
+  secret {
+    certificate = 
+    key_vault_id = 
   }
 }
 
 
 # downstream linux workers
 resource "azurerm_linux_virtual_machine_scale_set" "linux_worker" {
-  name                = "${local.prefix}-ds-linux-worker-vmss"
+  name                = "${local.prefix}-linux-worker-vmss"
   resource_group_name = azurerm_resource_group.this.name
   location            = azurerm_resource_group.this.location
   sku                 = "Standard_F2"
   instances           = 3
   admin_username      = "rancher"
-  upgrade_mode = "Manual"
 
   admin_ssh_key {
     username   = "rancher"
@@ -699,19 +988,13 @@ resource "azurerm_linux_virtual_machine_scale_set" "linux_worker" {
     ip_configuration {
       name      = "ds_linux_worker"
       primary   = true
-      subnet_id = azurerm_subnet.rancher.id
+      subnet_id = azurerm_subnet.downstream.id
     }
   }
 
   os_disk {
     storage_account_type = "Standard_LRS"
     caching              = "ReadWrite"
-    disk_size_gb = 50
-  }
-
-  tags = {
-    RancherTeam = local.prefix
-    Environment = "dev"
   }
 }
 
@@ -723,14 +1006,13 @@ resource "random_password" "windows_admin" {
 
 # downstream windows
 resource "azurerm_windows_virtual_machine_scale_set" "windows_worker" {
-  name                = "${local.prefix}-ds-windows-worker-vmss"
+  name                = "${local.prefix}-windows-worker-vmss"
   resource_group_name = azurerm_resource_group.this.name
   location            = azurerm_resource_group.this.location
   sku                 = "Standard_F2"
-  instances           = 3
+  instances           = 1
   admin_password      = random_password.windows_admin.result 
   admin_username      = "rancher"
-  upgrade_mode = "Manual"
 
   source_image_reference {
     publisher = "MicrosoftWindowsServer"
@@ -742,7 +1024,6 @@ resource "azurerm_windows_virtual_machine_scale_set" "windows_worker" {
   os_disk {
     storage_account_type = "Standard_LRS"
     caching              = "ReadWrite"
-    disk_size_gb = 75
   }
 
   network_interface {
@@ -752,80 +1033,24 @@ resource "azurerm_windows_virtual_machine_scale_set" "windows_worker" {
     ip_configuration {
       name      = "ds_windows_worker"
       primary   = true
-      subnet_id = azurerm_subnet.rancher.id
+      subnet_id = azurerm_subnet.downstream.id
     }
   }
-
-  tags = {
-    RancherTeam = local.prefix
-    Environment = "dev"
-  }
 }
 
-
-output "aadds_domain_name" {
-  value = azurerm_active_directory_domain_service.this.domain_name
+# create disk snapshots for k3s server+agent after creation and bootstrap
+resource "azurerm_snapshot" "server" {
+  name                = "snapshot"
+  location            = azurerm_resource_group.this.location
+  resource_group_name = azurerm_resource_group.this.name
+  create_option       = "Copy"
+  source_uri          = azurerm_managed_disk.server.id
 }
 
-output "aad_admin_user_password" {
-  value = azuread_user.admin.password
-  sensitive = true
-}
-
-output "aad_admin_user_principal_name" {
-  value = azuread_user.admin.user_principal_name
-}
-
-output "bastion_network_config" {
-  value = [azurerm_bastion_host.rancher.ip_configuration]
-}
-
-output "bastion_dns_name" {
-  value = azurerm_bastion_host.rancher.dns_name
-}
-
-output "postgres_server_name" {
-  value = azurerm_postgresql_database.this.server_name
-}
-
-output "postgres_admin_username" {
-  value = azurerm_postgresql_server.this.administrator_login
-}
-
-output "postgres_admin_password" {
-  value = azurerm_postgresql_server.this.administrator_login_password
-  sensitive = true
-}
-
-output "postgres_server_fqdn" {
-  value = azurerm_postgresql_server.this.fqdn
-}
-
-output "rancher_k3s_server_ip" {
-  value = azurerm_linux_virtual_machine.rancher_server.private_ip_address
-}
-
-output "rancher_k3s_agent_ip" {
-  value = azurerm_linux_virtual_machine.rancher_agent.private_ip_address
-}
-
-output "ds_windows_worker_ip" {
-  value = [azurerm_windows_virtual_machine_scale_set.windows_worker[*].network_interface]
-}
-
-output "ds_windows_password" {
-  value = azurerm_windows_virtual_machine_scale_set.windows_worker.admin_password
-  sensitive = true
-}
-
-output "ds_etcd_ip" {
-  value = [azurerm_linux_virtual_machine_scale_set.etcd[*].network_interface]
-}
-
-output "ds_cp_ip" {
-  value = [azurerm_linux_virtual_machine_scale_set.control_plane[*].network_interface]
-}
-
-output "ds_linux_worker_ip" {
-  value = [azurerm_linux_virtual_machine_scale_set.linux_worker[*].network_interface]
+resource "azurerm_snapshot" "agent" {
+  name                = "snapshot"
+  location            = azurerm_resource_group.this.location
+  resource_group_name = azurerm_resource_group.this.name
+  create_option       = "Copy"
+  source_uri          = azurerm_managed_disk.agent.id
 }
